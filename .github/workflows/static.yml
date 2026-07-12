@@ -31,13 +31,6 @@ jobs:
         with:
           persist-credentials: false
       
-      # Create artifact for reference, without GitHub Pages dependency
-      - name: Archive website content
-        uses: actions/upload-artifact@v4
-        with:
-          name: cloudflare-pages
-          path: '.'
-      
       - name: Remove thirdparty/longpipe (demasiado grande para deploy)
         run: rm -rf thirdparty/longpipe
       

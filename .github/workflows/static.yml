@@ -38,6 +38,9 @@ jobs:
           name: cloudflare-pages
           path: '.'
       
+      - name: Remove thirdparty/longpipe (demasiado grande para deploy)
+        run: rm -rf thirdparty/longpipe
+      
       - name: Deploy to Cloudflare Pages
         id: cloudflare-deployment
         uses: cloudflare/wrangler-action@v3

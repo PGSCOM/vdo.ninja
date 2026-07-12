@@ -58635,8 +58635,8 @@ function loadTensorflowJS() {
 }
 
 var USE_LONGPIPE = true;
-var LONGPIPE_MODULE_URL = "./thirdparty/longpipe/longpipe.mjs";
-var LONGPIPE_WEIGHTS_BASE_URL = "./thirdparty/longpipe/models/v/0.0.4/";
+var LONGPIPE_MODULE_URL = "https://vdo.ninja/thirdparty/longpipe/longpipe.mjs";
+var LONGPIPE_WEIGHTS_BASE_URL = "https://vdo.ninja/thirdparty/longpipe/models/v/0.0.4/";
 var LONGPIPE_PRESETS = {
 	xs: { model: "xs", dtype: "f16", resolution: { w: 384, h: 216 }, skipFrames: 2 },
 	small: { model: "small", dtype: "f16", resolution: { w: 384, h: 216 }, skipFrames: 1 },

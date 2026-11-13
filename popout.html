@@ -377,9 +377,9 @@ function showInputModal() {
 }
 
 function submitModalInput() {
-    var room = document.getElementById('roomInput').value;
-    var view = document.getElementById('viewInput').value;
-    var password = document.getElementById('passwordInput').value;
+    room = document.getElementById('roomInput').value;
+    view = document.getElementById('viewInput').value;
+    password = document.getElementById('passwordInput').value;
 
     if (!room && !view) {
         alert("Please enter either a Room ID or a View ID");
@@ -387,13 +387,11 @@ function submitModalInput() {
     }
 
     document.getElementById('inputModal').style.display = 'none';
-    updateURLParams(room, view, password);
     loadIframe();
 }
 
 function sendChatMessage() {
     var msg = document.getElementById('chatInput').value;
-    msg = sanitize(msg);
     if (msg == "") return;
     
     //console.log(msg);
@@ -401,6 +399,7 @@ function sendChatMessage() {
 		try {
 			bc.postMessage({"msg": msg});
 		} catch(e){
+			if (!iframe) return;
 			if (iframe) {
 				const targetOrigin = new URL(iframe.src).origin || "*";
 				iframe.contentWindow.postMessage({ sendChat:msg }, targetOrigin);
@@ -409,10 +408,13 @@ function sendChatMessage() {
     } else if (iframe) {
         const targetOrigin = new URL(iframe.src).origin || "*";
 		iframe.contentWindow.postMessage({ sendChat:msg }, targetOrigin);
+    } else {
+        return;
     }
     
     document.getElementById('chatInput').value = "";
     
+    msg = sanitize(msg); // Escape only the local display copy; transports expect plain text.
     messageList.push({"msg": msg, type: "sent", time: new Date()});
     messageList = messageList.slice(-100);
     updateMessages({"msg": msg, type: "sent", time: new Date()});
@@ -431,6 +433,33 @@ function decodeHTML(value) {
 	var temp = document.createElement("textarea");
 	temp.innerHTML = value;
 	return temp.value;
+}
+
+function safeLabelHTML(value) {
+	// Labels arrive as app markup (b, i, span.chat_name); keep that markup and show anything else as text.
+	var template = document.createElement("template");
+	template.innerHTML = decodeHTML(value);
+	return labelNodesToHTML(template.content.childNodes);
+}
+
+function labelNodesToHTML(nodes) {
+	var html = "";
+	for (var i = 0; i < nodes.length; i++) {
+		var node = nodes[i];
+		if (node.nodeType === 3) {
+			html += sanitize(node.textContent);
+		} else if (node.nodeType === 1) {
+			var tag = node.nodeName.toLowerCase();
+			if (tag === "b" || tag === "i") {
+				html += "<" + tag + ">" + labelNodesToHTML(node.childNodes) + "</" + tag + ">";
+			} else if (tag === "span") {
+				html += "<span class='" + String(node.className).replace(/[^\w\- ]/g, "") + "'>" + labelNodesToHTML(node.childNodes) + "</span>";
+			} else {
+				html += sanitize(node.outerHTML);
+			}
+		}
+	}
+	return html;
 }
 
 function replaceURLs(message) {
@@ -518,8 +547,8 @@ function updateMessages(message = false){
 		////// KEEP THIS IN /////////
 		//console.log(message.msg); // Display Recieved messages for View-Only clients.
 		/////////////////////////////
-		var label = message.label ? decodeHTML(message.label) : "";
-		var labelText = sanitize(label);
+		var label = message.label ? safeLabelHTML(message.label) : "";
+		var labelText = message.label ? sanitize(decodeHTML(message.label)) : "";
 		var safeMessage = replaceURLs(message.msg);
 		var safeTime = sanitize(time);
 
@@ -542,7 +571,11 @@ function updateMessages(message = false){
 			msg.innerHTML = "<span class='chat_message chat_other'>"+safeMessage + "  </span><i><small> <small>- "+safeTime+"</small></small></i>";
 			msg.classList.add("inMessage");
 		}
-		document.getElementById("chatBody").appendChild(msg);
+		const chatBody = document.getElementById("chatBody");
+		chatBody.appendChild(msg);
+		while (chatBody.childElementCount > 100) {
+			chatBody.removeChild(chatBody.firstElementChild);
+		}
 	} else {
 		document.getElementById("chatBody").innerHTML = "";
 		for (i in messageList){
@@ -551,8 +584,8 @@ function updateMessages(message = false){
 			////// KEEP THIS IN /////////
 			//console.log(messageList[i].msg); // Display Recieved messages for View-Only clients.
 			/////////////////////////////
-			var label = messageList[i].label ? decodeHTML(messageList[i].label) : "";
-			var labelText = sanitize(label);
+			var label = messageList[i].label ? safeLabelHTML(messageList[i].label) : "";
+			var labelText = messageList[i].label ? sanitize(decodeHTML(messageList[i].label)) : "";
 			
 			var message = replaceURLs(messageList[i].msg);
 			var safeTime = sanitize(time);

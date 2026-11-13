@@ -1,3 +1,6 @@
+import { initChat } from "./chat.js?ver=20261011-9";
+import { guestLabelText } from "../core/legacy/label-text.js?v=3";
+
 const root = document.getElementById("studio-root");
 const roomForm = document.getElementById("room-form");
 const roomNameInput = document.getElementById("room-name");
@@ -22,6 +25,7 @@ const DEFAULT_POLL_MS = 1400;
 const REQUEST_TIMEOUT_MS = 3500;
 const STORAGE_PREFIX = "studio.session.";
 const JOIN_SOUND_STORAGE_KEY = "studio.joinSound";
+const MESHCAST_STORAGE_KEY = "studio.meshcast.whipEndpoint";
 const TEMPLATE_VERSION = 1;
 const APP_STATE_VERSION = 4;
 const THUMBNAIL_REFRESH_MS = 5000;
@@ -33,6 +37,7 @@ const SAMPLE_SOURCES = [
 ];
 
 let storedJoinSound = false;
+let sessionSaveBlocked = false;
 try {
 	storedJoinSound = localStorage.getItem(JOIN_SOUND_STORAGE_KEY) === "1";
 } catch (error) {
@@ -46,13 +51,12 @@ const state = {
 	sourceSnapshotReady: false,
 	pollTimer: null,
 	thumbnailTimer: null,
-	saveTimer: null,
 	audioContext: null,
 	joinSound: storedJoinSound,
-	requestId: 0,
 	pendingRequests: new Map(),
 	activeSceneId: "auto",
 	lastAppliedSceneId: null,
+	featuredChat: "",
 	selectedBoxId: null,
 	pendingDeleteSceneId: null,
 	pendingDeleteTimer: null,
@@ -84,15 +88,29 @@ function clone(value) {
 	return JSON.parse(JSON.stringify(value));
 }
 
+function resizeStage() {
+	// The inspector and wrapped toolbar reduce the space available to the preview.
+	if (window.matchMedia("(max-width: 1000px)").matches) {
+		stage.style.width = "";
+		return;
+	}
+	const shell = stage.parentElement;
+	const style = window.getComputedStyle(shell);
+	const width = shell.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+	const height = shell.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom) - parseFloat(style.rowGap) - boxInspector.offsetHeight;
+	stage.style.width = Math.max(0, Math.min(1180, width, height * 16 / 9)) + "px";
+}
+
 function createId(prefix) {
 	return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function sanitizeRoomName(value) {
+	// Match the room name used by the embedded director and guest pages.
 	return (value || "")
 		.trim()
-		.replace(/[^a-zA-Z0-9_.-]/g, "")
-		.slice(0, 80);
+		.replace(/[\W]+/g, "_")
+		.slice(0, 30);
 }
 
 function randomRoomName() {
@@ -103,17 +121,62 @@ function getActiveScene() {
 	return state.scenes.find(scene => scene.id === state.activeSceneId) || state.scenes[0];
 }
 
-function scheduleSave() {
-	clearTimeout(state.saveTimer);
-	state.saveTimer = setTimeout(saveSession, 200);
-}
-
 function sessionStorageKey() {
 	return `${STORAGE_PREFIX}${state.room || "default"}`;
 }
 
+function readMeshcastEndpoint() {
+	var endpoint = document.getElementById("meshcast-endpoint").value.trim();
+	try {
+		var url = new URL(endpoint);
+		if (url.protocol === "https:" || url.protocol === "http:") {
+			return endpoint;
+		}
+	} catch (error) {
+		// Keep private publishing URLs out of error logs.
+	}
+	document.getElementById("meshcast-storage-status").textContent = "Enter a valid Meshcast WHIP URL. Any previously saved URL is unchanged.";
+	return "";
+}
+
+function saveMeshcastEndpoint() {
+	var remember = document.getElementById("remember-meshcast");
+	var status = document.getElementById("meshcast-storage-status");
+	var endpoint = "";
+	if (remember.checked) {
+		endpoint = readMeshcastEndpoint();
+		if (!endpoint) {
+			return;
+		}
+	}
+	try {
+		if (remember.checked) {
+			localStorage.setItem(MESHCAST_STORAGE_KEY, endpoint);
+			status.textContent = "WHIP URL saved in this browser.";
+		} else {
+			localStorage.removeItem(MESHCAST_STORAGE_KEY);
+			status.textContent = "WHIP URL is not saved. You can still use it for this visit.";
+		}
+	} catch (error) {
+		status.textContent = "Browser storage is unavailable. Saved settings could not be changed. You can still Go Live; use browser site settings to clear a previously saved URL.";
+	}
+}
+
+function loadMeshcastEndpoint() {
+	try {
+		var endpoint = localStorage.getItem(MESHCAST_STORAGE_KEY);
+		if (endpoint) {
+			document.getElementById("meshcast-endpoint").value = endpoint;
+			document.getElementById("remember-meshcast").checked = true;
+			document.getElementById("meshcast-storage-status").textContent = "Saved WHIP URL restored from this browser.";
+		}
+	} catch (error) {
+		document.getElementById("meshcast-storage-status").textContent = "Browser storage is unavailable. Paste your WHIP URL to Go Live for this visit.";
+	}
+}
+
 function saveSession() {
-	if (!state.room) {
+	if (!state.room || sessionSaveBlocked) {
 		return;
 	}
 	const payload = {
@@ -132,23 +195,48 @@ function saveSession() {
 }
 
 function loadSession() {
+	sessionSaveBlocked = false;
 	clearPendingSceneDelete(false);
 	state.scenes = clone(defaultScenes);
 	state.activeSceneId = "scene_1";
+	state.lastAppliedSceneId = null;
 	state.placeholders = [];
+	let original = null;
+	let damaged = false;
 	try {
-		const saved = JSON.parse(localStorage.getItem(sessionStorageKey()) || "null");
+		original = localStorage.getItem(sessionStorageKey());
+		const saved = JSON.parse(original || "null");
 		if (saved && saved.version === APP_STATE_VERSION && Array.isArray(saved.scenes) && saved.scenes.length) {
-			state.scenes = saved.scenes;
-			state.activeSceneId = saved.activeSceneId || state.scenes[0].id;
-			state.lastAppliedSceneId = saved.lastAppliedSceneId || null;
-			state.placeholders = Array.isArray(saved.placeholders) ? saved.placeholders : [];
-			state.brand = { ...state.brand, ...(saved.brand || {}) };
-		}
+			const scenes = [];
+			saved.scenes.forEach((scene, index) => {
+				try {
+					const restored = normalizeTemplateScene(scene, index);
+					scenes.push(restored);
+					if (scene.id === saved.activeSceneId) state.activeSceneId = restored.id;
+				} catch (error) { damaged = true; }
+			});
+			if (scenes.length) state.scenes = scenes;
+			if (Array.isArray(saved.placeholders)) saved.placeholders.forEach((item, index) => {
+				try { state.placeholders.push(normalizePlaceholders([item], index)[0]); }
+				catch (error) { damaged = true; }
+			});
+			state.brand = normalizeBrand(saved.brand);
+		} else if (saved) damaged = true;
 	} catch (error) {
+		damaged = true;
+		if (original === null) sessionSaveBlocked = true;
 		console.warn("Unable to load studio session", error);
 	}
-	if (!getActiveScene()) {
+	if (damaged && original) {
+		try {
+			localStorage.setItem(sessionStorageKey() + ".recovery." + Date.now(), original);
+			showToast("Recovered valid saved items. The original session is kept in this browser as a recovery copy.");
+		} catch (error) {
+			sessionSaveBlocked = true;
+			showToast("Saved data could not be recovered safely. Automatic saving is paused to preserve it.");
+		}
+	}
+	if (!state.scenes.some(scene => scene.id === state.activeSceneId)) {
 		state.activeSceneId = state.scenes[0].id;
 	}
 	if (state.lastAppliedSceneId && !state.scenes.some(scene => scene.id === state.lastAppliedSceneId)) {
@@ -157,24 +245,30 @@ function loadSession() {
 }
 
 function normalizeTemplateScene(scene, index) {
+	if (!scene || typeof scene !== "object" || !Array.isArray(scene.layout)) {
+		throw new Error("Invalid scene");
+	}
 	const name =
 		String(scene.name || `Scene ${index + 1}`)
 			.trim()
 			.slice(0, 48) || `Scene ${index + 1}`;
-	const layout = Array.isArray(scene.layout)
-		? scene.layout.slice(0, 16).map((item, itemIndex) => ({
-				id: createId("box"),
-				streamID: typeof item.streamID === "string" ? item.streamID : "",
-				slot: Number.isFinite(parseInt(item.slot, 10)) ? parseInt(item.slot, 10) : itemIndex,
-				label: typeof item.label === "string" ? item.label.slice(0, 80) : "",
-				x: clamp(parseFloat(item.x) || 0, 0, 99),
-				y: clamp(parseFloat(item.y) || 0, 0, 99),
-				w: clamp(parseFloat(item.w) || 40, 7, 100),
-				h: clamp(parseFloat(item.h) || 36, 8, 100),
-				z: parseInt(item.z, 10) || itemIndex + 1,
-				cover: item.cover !== false
-			}))
-		: [];
+	const layout = scene.layout.map((item, itemIndex) => {
+		if (!item || typeof item !== "object") {
+			throw new Error("Invalid layout item");
+		}
+		return {
+			id: createId("box"),
+			streamID: typeof item.streamID === "string" ? item.streamID : "",
+			slot: Number.isFinite(parseInt(item.slot, 10)) && parseInt(item.slot, 10) >= 0 ? parseInt(item.slot, 10) : itemIndex,
+			label: typeof item.label === "string" ? item.label.slice(0, 80) : "",
+			x: clamp(parseFloat(item.x) || 0, 0, 99),
+			y: clamp(parseFloat(item.y) || 0, 0, 99),
+			w: clamp(parseFloat(item.w) || 40, 7, 100),
+			h: clamp(parseFloat(item.h) || 36, 8, 100),
+			z: parseInt(item.z, 10) || itemIndex + 1,
+			cover: item.cover !== false
+		};
+	});
 	layout.forEach(item => {
 		item.x = clamp(item.x, 0, 93);
 		item.y = clamp(item.y, 0, 92);
@@ -187,6 +281,41 @@ function normalizeTemplateScene(scene, index) {
 		auto: Boolean(scene.auto) && !layout.length,
 		layout
 	};
+}
+
+function normalizeBrand(brand) {
+	brand = brand || {};
+	return {
+		background: /^#[0-9a-f]{6}$/i.test(brand.background || "") ? brand.background : state.brand.background,
+		radius: clamp(parseInt(brand.radius, 10) || 0, 0, 32),
+		labels: brand.labels !== false
+	};
+}
+
+function normalizePlaceholders(placeholders, offset = 0) {
+	if (!Array.isArray(placeholders)) {
+		return [];
+	}
+	return placeholders.map((item, index) => {
+		index += offset;
+		if (!item || typeof item !== "object") {
+			throw new Error("Invalid guest slot");
+		}
+		let slot = parseInt(item.slot, 10);
+		if (!Number.isFinite(slot) || !slot) {
+			slot = index + 1;
+		}
+		return {
+			streamID: createId("placeholder"),
+			label: String(item.label || `Guest Slot ${index + 1}`).slice(0, 80),
+			slot: Math.max(1, slot),
+			placeholder: true,
+			sample: item.sample === true,
+			color: /^#[0-9a-f]{6}$/i.test(item.color || "") ? item.color : "#2457d6",
+			screenSharing: item.screenSharing === true,
+			loudness: clamp(parseInt(item.loudness, 10) || 0, 0, 100)
+		};
+	});
 }
 
 function exportTemplate() {
@@ -218,29 +347,24 @@ function importTemplateFile(file) {
 			if (!payload || !Array.isArray(payload.scenes) || !payload.scenes.length) {
 				throw new Error("Missing scenes");
 			}
-			clearPendingSceneDelete(false);
-			state.scenes = payload.scenes.slice(0, 24).map(normalizeTemplateScene);
-			state.activeSceneId = state.scenes[0].id;
-			state.lastAppliedSceneId = null;
-			state.selectedBoxId = null;
+			const scenes = payload.scenes.map(normalizeTemplateScene);
+			let brand = state.brand;
+			let placeholders = state.placeholders;
 			if (payload.brand && typeof payload.brand === "object") {
-				state.brand = {
-					background: /^#[0-9a-f]{6}$/i.test(payload.brand.background || "") ? payload.brand.background : state.brand.background,
-					radius: clamp(parseInt(payload.brand.radius, 10) || 0, 0, 32),
-					labels: payload.brand.labels !== false
-				};
+				brand = normalizeBrand(payload.brand);
 			}
 			if (Array.isArray(payload.placeholders)) {
-				state.placeholders = payload.placeholders.slice(0, 24).map((item, index) => ({
-					streamID: createId("placeholder"),
-					label: String(item.label || `Guest Slot ${index + 1}`).slice(0, 80),
-					slot: parseInt(item.slot, 10) || index + 1,
-					placeholder: true
-				}));
+				placeholders = normalizePlaceholders(payload.placeholders);
 			}
+			clearPendingSceneDelete(false);
+			state.scenes = scenes;
+			state.activeSceneId = scenes[0].id;
+			state.lastAppliedSceneId = null;
+			state.selectedBoxId = null;
+			state.brand = brand;
+			state.placeholders = placeholders;
 			renderAll();
 			applySceneToFrame();
-			scheduleSave();
 			showToast("Template imported");
 		} catch (error) {
 			showToast("Invalid template file");
@@ -278,11 +402,6 @@ function setOutputStatus(text, mode = "idle") {
 	}
 }
 
-function buildBaseUrl() {
-	const base = new URL("../", window.location.href);
-	return base.href.replace(/\/$/, "");
-}
-
 function currentExtraParams() {
 	const extra = new URLSearchParams(window.location.search);
 	["room", "r", "director", "dir", "password", "pass", "pw"].forEach(key => extra.delete(key));
@@ -303,7 +422,6 @@ function buildDirectorUrl() {
 	url.searchParams.set("ltb", extra.has("ltb") ? extra.get("ltb") : "1500");
 	url.searchParams.set("nocontrolbarspace", "");
 	url.searchParams.set("transparent", "");
-	url.searchParams.set("cleanoutput", "");
 	url.searchParams.set("hideheader", "");
 	url.searchParams.set("showlabels", "");
 	url.searchParams.set("hidetranslate", "");
@@ -311,11 +429,13 @@ function buildDirectorUrl() {
 	url.searchParams.set("chatbutton", "0");
 	url.searchParams.set("director", state.room);
 	url.searchParams.set("slotmode", "");
-	url.searchParams.set("showdirector", "");
+	// Keep the director's return feed out of scenes unless showdirector is requested.
 	if (state.password) {
 		url.searchParams.set("password", state.password);
 	}
 	appendParams(url, extra);
+	url.searchParams.delete("broadcast");
+	url.searchParams.delete("bc");
 	return url.href;
 }
 
@@ -329,6 +449,10 @@ async function buildInviteUrl() {
 		url.searchParams.set("password", state.password);
 	}
 	appendParams(url, extra);
+	url.searchParams.delete("codirector");
+	url.searchParams.delete("directorpassword");
+	url.searchParams.delete("dirpass");
+	url.searchParams.delete("dp");
 	return url.href;
 }
 
@@ -360,6 +484,13 @@ function buildSceneUrl(options = {}) {
 	if (state.password) {
 		url.searchParams.set("password", state.password);
 	}
+	appendParams(url, currentExtraParams());
+	url.searchParams.delete("broadcast");
+	url.searchParams.delete("bc");
+	url.searchParams.delete("codirector");
+	url.searchParams.delete("directorpassword");
+	url.searchParams.delete("dirpass");
+	url.searchParams.delete("dp");
 	return url.href;
 }
 
@@ -367,7 +498,7 @@ function framePost(message) {
 	if (!directorFrame.contentWindow) {
 		return;
 	}
-	directorFrame.contentWindow.postMessage(message, "*");
+	directorFrame.contentWindow.postMessage(message, window.location.origin);
 }
 
 function frameRequest(message, responseKey, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -383,7 +514,7 @@ function frameRequest(message, responseKey, timeoutMs = REQUEST_TIMEOUT_MS) {
 }
 
 function handleFrameMessage(event) {
-	if (event.source !== directorFrame.contentWindow || !event.data || typeof event.data !== "object") {
+	if (event.source !== directorFrame.contentWindow || event.origin !== window.location.origin || !event.data || typeof event.data !== "object") {
 		return;
 	}
 	const data = event.data;
@@ -395,7 +526,7 @@ function handleFrameMessage(event) {
 			pending.resolve(data[pending.responseKey]);
 		}
 	}
-	if (data.detailedState) {
+	if (data.detailedState && !data.cib) {
 		applyDetailedState(data.detailedState);
 	}
 	if (data.action === "image-frame-capture" && data.value) {
@@ -407,6 +538,9 @@ function handleFrameMessage(event) {
 	if (data.action === "guest-connected" || data.action === "view-connection" || data.action === "slot-updated" || data.action === "director-share") {
 		refreshState();
 	}
+	if (data.action === "scene-connected" && data.value == "0" && data.UUID) {
+		framePost({ scene: "0", UUID: data.UUID, layout: buildLayoutPayload(getActiveScene()) });
+	}
 	if (data.action === "layout-updated") {
 		setStatus("Updated", "live");
 	}
@@ -416,6 +550,14 @@ async function refreshState() {
 	if (!state.iframeReady) {
 		return;
 	}
+	// Let the embedded page receive clicks while an alert or prompt is open.
+	const frameDocument = directorFrame.contentDocument;
+	stage.dataset.dialogOpen = frameDocument && frameDocument.querySelector(".alertModal, .promptModal") ? "true" : "false";
+	for (const request of state.pendingRequests.values()) {
+		if (request.responseKey === "detailedState") {
+			return;
+		}
+	}
 	try {
 		const detailedState = await frameRequest({ getDetailedState: true }, "detailedState");
 		applyDetailedState(detailedState);
@@ -423,6 +565,13 @@ async function refreshState() {
 		setStatus(liveCount ? `${liveCount} source${liveCount === 1 ? "" : "s"}` : "Ready", "live");
 	} catch (error) {
 		setStatus("Reconnecting", "idle");
+	} finally {
+		for (const source of state.sources.values()) {
+			const card = getSourceCard(source.streamID);
+			if (card) {
+				updateSourceMeter(source, card.querySelector(".source-card__vu"));
+			}
+		}
 	}
 }
 
@@ -437,6 +586,7 @@ function getLiveSourceCount() {
 }
 
 function applyDetailedState(detailedState) {
+	const previousLayout = JSON.stringify(buildLayoutPayload(getActiveScene()));
 	const nextSources = new Map();
 	const joinedSources = [];
 	const now = Date.now();
@@ -451,12 +601,12 @@ function applyDetailedState(detailedState) {
 		const others = item.others || {};
 		const source = {
 			streamID: item.streamID,
-			label: item.label || item.streamID,
+			label: item.label ? guestLabelText(item.label) : item.streamID,
 			slot: item.slot ? parseInt(item.slot, 10) : false,
 			group: item.group || [],
-			muted: Boolean(item.muted || others["mute-guest"]),
-			videoMuted: Boolean(item.videoMuted || others["mute-video-guest"]),
-			screenSharing: Boolean(item.screenSharing),
+			muted: Boolean(item.muted || others["mute-guest"] == 1),
+			videoMuted: Boolean(item.videoMuted || others["mute-video-guest"] == 1),
+			screenSharing: Boolean(item.screenSharing || item.streamID.endsWith(":s")),
 			videoVisible: Boolean(item.videoVisible),
 			featured: Boolean(item.featured),
 			queued: Boolean(others["remove-queue"]),
@@ -464,6 +614,9 @@ function applyDetailedState(detailedState) {
 			disconnected: false,
 			disconnectedAt: 0,
 			loudness: previous ? previous.loudness : 0,
+			loudnessAt: previous ? previous.loudnessAt : 0,
+			peak: previous ? previous.peak : 0,
+			peakUntil: previous ? previous.peakUntil : 0,
 			thumbnailUrl: previous ? previous.thumbnailUrl : "",
 			thumbnailAt: previous ? previous.thumbnailAt : 0,
 			devices: previous ? previous.devices : [],
@@ -500,6 +653,9 @@ function applyDetailedState(detailedState) {
 	}
 	const sourceListChanged = !sourceMapsHaveSameRenderableState(state.sources, nextSources);
 	state.sources = nextSources;
+	if (previousLayout !== JSON.stringify(buildLayoutPayload(getActiveScene()))) {
+		applySceneToFrame();
+	}
 	if (sourceListChanged) {
 		renderSources();
 		renderLayout();
@@ -591,11 +747,46 @@ function applyLoudness(loudness) {
 			return;
 		}
 		source.loudness = clamp(parseInt(value, 10) || 0, 0, 100);
-		const meter = getSourceCard(streamID)?.querySelector(".source-card__meter span");
-		if (meter) {
-			meter.style.width = `${source.loudness}%`;
+		source.loudnessAt = Date.now();
+		const card = getSourceCard(streamID);
+		if (card) {
+			updateSourceMeter(source, card.querySelector(".source-card__vu"));
 		}
 	});
+}
+
+function updateSourceMeter(source, meter) {
+	if (!meter) {
+		return;
+	}
+	const now = Date.now();
+	const stale = !source.placeholder && (!source.loudnessAt || now - source.loudnessAt > 3000);
+	let level = clamp(source.loudness || 0, 0, 100);
+	let status = "";
+	if (source.disconnected) {
+		status = "Disconnected";
+	} else if (source.queued) {
+		status = "Waiting";
+	} else if (source.muted) {
+		status = "Muted";
+	} else if (stale || (source.placeholder && !source.sample)) {
+		status = "Waiting";
+	}
+	if (status) {
+		level = 0;
+		source.peak = 0;
+		source.peakUntil = 0;
+	} else if (level >= (source.peak || 0) || now >= (source.peakUntil || 0)) {
+		source.peak = level;
+		source.peakUntil = now + 1000;
+	}
+	meter.querySelector(".source-card__meter-fill").style.clipPath = `inset(0 ${100 - level}% 0 0)`;
+	const peak = meter.querySelector(".source-card__meter-peak");
+	peak.style.left = `${source.peak || 0}%`;
+	peak.hidden = !source.peak;
+	meter.querySelector(".source-card__meter-value").textContent = status || `${Math.round(level)}`;
+	meter.setAttribute("aria-valuenow", Math.round(level));
+	meter.setAttribute("aria-valuetext", status || `${Math.round(level)} of 100; peak ${Math.round(source.peak || 0)}`);
 }
 
 function requestSourceThumbnails() {
@@ -612,10 +803,7 @@ function requestSourceThumbnails() {
 }
 
 function sourceLabelForItem(item) {
-	if (item.streamID && state.sources.has(item.streamID)) {
-		return state.sources.get(item.streamID).label || item.streamID;
-	}
-	const source = findSourceBySlot(item.slot);
+	const source = sourceForLayoutItem(item);
 	if (source) {
 		return source.label || source.streamID;
 	}
@@ -625,7 +813,7 @@ function sourceLabelForItem(item) {
 function findSourceBySlot(slotZeroBased) {
 	const slot = parseInt(slotZeroBased, 10) + 1;
 	for (const source of state.sources.values()) {
-		if (source.slot === slot) {
+		if (source.slot === slot && !source.disconnected && !source.queued) {
 			return source;
 		}
 	}
@@ -639,7 +827,10 @@ function findSourceBySlot(slotZeroBased) {
 
 function isSourceOnStage(source) {
 	const scene = getActiveScene();
-	return Boolean(scene && !scene.auto && scene.layout.some(item => sourceMatchesLayoutItem(source, item)));
+	if (scene && scene.auto) {
+		return !source.placeholder && !source.disconnected && !source.queued;
+	}
+	return Boolean(scene && scene.layout.some(item => sourceMatchesLayoutItem(source, item)));
 }
 
 function buildSourceList() {
@@ -654,7 +845,7 @@ function buildSourceList() {
 		}
 		return a.streamID.localeCompare(b.streamID);
 	});
-	return liveSources.concat(state.placeholders);
+	return liveSources.concat(state.placeholders.filter(placeholder => !liveSources.some(source => !source.disconnected && !source.queued && source.slot === placeholder.slot)));
 }
 
 function normalizeGuestDevices(devices) {
@@ -819,12 +1010,15 @@ function renderSources() {
 			preview.append(placeholderIcon);
 		}
 		const meter = document.createElement("div");
-		meter.className = "source-card__meter";
-		meter.title = "Audio level";
-		const meterFill = document.createElement("span");
-		meterFill.style.width = `${clamp(source.loudness || 0, 0, 100)}%`;
-		meter.append(meterFill);
-		preview.append(meter);
+		meter.className = "source-card__vu";
+		meter.setAttribute("role", "meter");
+		meter.setAttribute("aria-live", "off");
+		meter.setAttribute("aria-label", `${source.label || source.streamID} VU level`);
+		meter.setAttribute("aria-valuemin", "0");
+		meter.setAttribute("aria-valuemax", "100");
+		meter.title = "Relative incoming audio level; the marker holds the highest level for one second. This is not a dB or clipping measurement.";
+		meter.innerHTML = '<div class="source-card__meter-heading"><span>VU <small>relative level</small></span><span class="source-card__meter-value"></span></div><div class="source-card__meter"><span class="source-card__meter-fill"></span><span class="source-card__meter-peak" hidden></span></div><div class="source-card__meter-scale" aria-hidden="true"><span>0</span><span>25</span><span>50</span><span>75</span><span>100</span></div>';
+		updateSourceMeter(source, meter);
 
 		const header = document.createElement("div");
 		header.className = "source-card__header";
@@ -859,6 +1053,20 @@ function renderSources() {
 			}
 		});
 		actions.append(stageButton);
+		if (isPlaceholder) {
+			const removeButton = document.createElement("button");
+			removeButton.type = "button";
+			removeButton.className = "button button--secondary";
+			removeButton.textContent = "Remove";
+			removeButton.addEventListener("click", () => {
+				state.placeholders = state.placeholders.filter(item => item.streamID !== source.streamID);
+				state.scenes.forEach(scene => {
+					scene.layout = scene.layout.filter(item => !sourceMatchesLayoutItem(source, item));
+				});
+				finishLayoutEdit();
+			});
+			actions.append(removeButton);
+		}
 		if (!isPlaceholder && !source.disconnected && source.queued) {
 			const activateButton = document.createElement("button");
 			activateButton.type = "button";
@@ -905,7 +1113,7 @@ function renderSources() {
 			soloButton.addEventListener("click", () => soloSource(source.streamID));
 			actions.append(soloButton);
 		}
-		card.append(preview, header, meta, sourceState, actions);
+		card.append(preview, header, meta, sourceState, meter, actions);
 		const deviceControls = renderSourceDeviceControls(source);
 		if (deviceControls) {
 			card.append(deviceControls);
@@ -956,7 +1164,7 @@ function renderScenes() {
 			const badge = document.createElement("span");
 			badge.className = "scene-card__badge";
 			badge.textContent = "Applied";
-			button.append(badge);
+			text.append(badge);
 		}
 		sceneList.append(button);
 	});
@@ -966,7 +1174,7 @@ function renderLayout() {
 	const scene = getActiveScene();
 	activeSceneTitle.value = scene ? scene.name : "Scene";
 	stageOverlay.innerHTML = "";
-	stage.dataset.hasLayout = scene && (scene.auto ? state.sources.size > 0 : scene.layout.length > 0) ? "true" : "false";
+	stage.dataset.hasLayout = scene && (state.featuredChat || (scene.auto ? Array.from(state.sources.values()).some(source => !source.disconnected && !source.queued) : scene.layout.length > 0)) ? "true" : "false";
 	stage.dataset.layoutMode = scene && scene.auto ? "auto" : "custom";
 	if (!scene) {
 		stageEmpty.textContent = "No scene selected";
@@ -1122,7 +1330,6 @@ function renderBoxInspector() {
 function finishLayoutEdit() {
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function updateSelectedBox(values) {
@@ -1218,7 +1425,7 @@ function renameActiveScene() {
 	}
 	scene.name = nextName;
 	renderScenes();
-	scheduleSave();
+	saveSession();
 }
 
 function renameActiveSceneLive() {
@@ -1232,7 +1439,7 @@ function renameActiveSceneLive() {
 	}
 	scene.name = nextName;
 	renderScenes();
-	scheduleSave();
+	saveSession();
 }
 
 function activateScene(sceneId) {
@@ -1246,7 +1453,6 @@ function activateScene(sceneId) {
 	state.selectedBoxId = null;
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function duplicateActiveScene() {
@@ -1311,7 +1517,6 @@ function deleteActiveScene() {
 	state.activeSceneId = state.scenes[Math.max(0, index - 1)].id;
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function moveActiveScene(direction) {
@@ -1327,7 +1532,7 @@ function moveActiveScene(direction) {
 	state.scenes.splice(nextIndex, 0, moved);
 	renderScenes();
 	syncSceneActionButtons();
-	scheduleSave();
+	saveSession();
 }
 
 function addScene() {
@@ -1356,7 +1561,9 @@ function ensureEditableScene() {
 		return scene;
 	}
 	scene.auto = false;
-	scene.layout = Array.isArray(scene.layout) ? scene.layout : [];
+	const sources = Array.from(state.sources.values()).filter(source => !source.disconnected && !source.queued);
+	const rects = getGridRects(sources.length);
+	scene.layout = sources.map((source, index) => ({ ...layoutItemFromSource(source, index), ...rects[index] }));
 	return scene;
 }
 
@@ -1365,7 +1572,13 @@ function getSourceById(sourceId) {
 }
 
 function sourceMatchesLayoutItem(source, item) {
-	return Boolean(source && item && (item.streamID === source.streamID || (source.slot && parseInt(item.slot, 10) + 1 === source.slot)));
+	if (!source || !item) {
+		return false;
+	}
+	if (item.streamID) {
+		return item.streamID === source.streamID;
+	}
+	return Boolean(source.slot && parseInt(item.slot, 10) + 1 === source.slot);
 }
 
 function layoutItemFromSource(source, index) {
@@ -1410,11 +1623,22 @@ function addSourceToStage(sourceId, position = null) {
 	if (!source) {
 		return;
 	}
+	const wasAuto = getActiveScene().auto;
 	const scene = ensureEditableScene();
 	const existing = scene.layout.find(item => sourceMatchesLayoutItem(source, item));
 	if (existing) {
 		state.selectedBoxId = existing.id;
-		renderAll();
+		if (wasAuto) {
+			if (position) {
+				existing.x = position.x;
+				existing.y = position.y;
+				existing.w = position.w;
+				existing.h = position.h;
+			}
+			finishLayoutEdit();
+		} else {
+			renderAll();
+		}
 		return;
 	}
 	const count = scene.layout.length;
@@ -1439,22 +1663,20 @@ function addSourceToStage(sourceId, position = null) {
 	state.selectedBoxId = scene.layout[scene.layout.length - 1].id;
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function removeSourceFromStage(sourceId) {
-	const scene = getActiveScene();
 	const source = getSourceById(sourceId);
-	if (!scene || scene.auto || !source) {
+	if (!source) {
 		return;
 	}
+	const scene = ensureEditableScene();
 	scene.layout = scene.layout.filter(item => !sourceMatchesLayoutItem(source, item));
 	if (!scene.layout.some(item => item.id === state.selectedBoxId)) {
 		state.selectedBoxId = null;
 	}
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function assignSourceToLayoutItem(sourceId, targetBoxId) {
@@ -1486,7 +1708,6 @@ function assignSourceToLayoutItem(sourceId, targetBoxId) {
 	state.selectedBoxId = target.id;
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function soloSource(sourceId) {
@@ -1512,7 +1733,6 @@ function soloSource(sourceId) {
 	];
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function spotlightSource(sourceId) {
@@ -1539,19 +1759,18 @@ function spotlightSource(sourceId) {
 		z: index + 1,
 		cover: true
 	}));
-	state.selectedBoxId = scene.layout[0]?.id || null;
+	state.selectedBoxId = scene.layout.length ? scene.layout[0].id : null;
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function toggleSourceControl(streamID, control) {
 	const source = state.sources.get(streamID);
-	if (!source) {
+	if (!source || source.disconnected || source.queued) {
 		return;
 	}
 	const action = control === "video" ? "video" : "mic";
-	framePost({ function: "targetGuest", target: streamID, action });
+	framePost({ target: streamID, action });
 	if (control === "video") {
 		source.videoMuted = !source.videoMuted;
 		setStatus(source.videoMuted ? "Camera off request sent" : "Camera on request sent", "live");
@@ -1581,7 +1800,7 @@ async function loadSourceDevices(streamID, options = {}) {
 		if (!response || response.ok === false) {
 			liveSource.devicesLoaded = false;
 			liveSource.devices = [];
-			liveSource.deviceError = response?.error || "Unable to load devices";
+			liveSource.deviceError = (response && response.error) || "Unable to load devices";
 		} else {
 			liveSource.devices = normalizeGuestDevices(response.devices);
 			liveSource.devicesLoaded = true;
@@ -1618,28 +1837,34 @@ async function changeSourceDevice(streamID, kind, deviceId) {
 	try {
 		const response = await frameRequest({ function: "setGuestMediaDevice", target: streamID, kind, deviceId }, "guestMediaDeviceChange", 9500);
 		if (!response || response.ok === false) {
-			throw new Error(response?.error || "Unable to change device");
+			throw new Error((response && response.error) || "Unable to change device");
 		}
 		showToast(`${label} changed`);
 		setTimeout(() => loadSourceDevices(streamID, { silent: true }), 900);
 		setTimeout(refreshState, 900);
 	} catch (error) {
 		setStatus(`${label} change failed`, "idle");
-		showToast(`${label} change failed`);
+		showToast(error.message || `${label} change failed`);
 	}
 }
 
-function activateQueuedGuest(streamID) {
+async function activateQueuedGuest(streamID) {
 	const source = state.sources.get(streamID);
 	if (!source || !source.queued) {
 		return;
 	}
-	frameRequest({ function: "activateQueuedGuest", target: streamID }, "queuedGuestActivation", 4500).catch(() => {});
-	source.queued = false;
-	renderSources();
 	setStatus("Activating guest", "live");
-	showToast("Activation sent");
-	setTimeout(refreshState, 700);
+	try {
+		const response = await frameRequest({ function: "activateQueuedGuest", target: streamID }, "queuedGuestActivation", 4500);
+		if (!response || response.ok !== true) {
+			throw new Error("Unable to activate guest");
+		}
+		showToast("Activation sent");
+		refreshState();
+	} catch (error) {
+		setStatus("Reconnecting", "idle");
+		showToast("Unable to activate guest");
+	}
 }
 
 function currentLayoutItemsForPreset(limit = 9) {
@@ -1654,8 +1879,8 @@ function currentLayoutItemsForPreset(limit = 9) {
 }
 
 function sourceForLayoutItem(item) {
-	if (item.streamID && state.sources.has(item.streamID)) {
-		return state.sources.get(item.streamID);
+	if (item.streamID) {
+		return state.sources.get(item.streamID) || null;
 	}
 	return findSourceBySlot(item.slot);
 }
@@ -1677,6 +1902,14 @@ function prioritizePresetItems(items, name) {
 }
 
 function applyPreset(name) {
+	if (name === "auto") {
+		const scene = getActiveScene();
+		scene.auto = true;
+		scene.layout = [];
+		state.selectedBoxId = null;
+		finishLayoutEdit();
+		return;
+	}
 	const scene = ensureEditableScene();
 	const limit = getPresetLimit(name);
 	const items = prioritizePresetItems(currentLayoutItemsForPreset(limit), name);
@@ -1694,7 +1927,6 @@ function applyPreset(name) {
 	}));
 	renderAll();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 function getPresetLimit(name) {
@@ -1827,22 +2059,35 @@ function exportLayoutItem(item) {
 }
 
 function buildLayoutPayload(scene) {
-	if (!scene || scene.auto) {
+	if (!scene || (scene.auto && !state.featuredChat)) {
 		return false;
 	}
-	const hasDirectStreams = scene.layout.some(item => item.streamID);
+	let items = scene.layout;
+	if (scene.auto) {
+		const sources = Array.from(state.sources.values()).filter(source => !source.disconnected && !source.queued);
+		const rects = getGridRects(sources.length);
+		items = sources.map((source, index) => ({ ...layoutItemFromSource(source, index), ...rects[index] }));
+	}
+	const overlay = state.featuredChat ? {
+		x: 5, y: 73, w: 90, h: 25, z: 1000000,
+		text: state.featuredChat, textColor: "#ffffff", textBackground: "#101722",
+		fontSize: "2.4vh", textPosition: "50%"
+	} : null;
+	const hasDirectStreams = items.some(item => item.streamID);
 	if (!hasDirectStreams) {
-		return scene.layout.map(exportLayoutItem);
+		const layout = items.map(exportLayoutItem);
+		if (overlay) layout.push(overlay);
+		return layout;
 	}
 	const combined = {};
-	scene.layout.forEach(item => {
+	items.forEach(item => {
 		const output = exportLayoutItem(item);
 		if (item.streamID) {
 			combined[item.streamID] = output;
 			return;
 		}
 		const source = findSourceBySlot(item.slot);
-		if (source) {
+		if (source && !source.placeholder) {
 			combined[source.streamID] = output;
 			return;
 		}
@@ -1851,20 +2096,23 @@ function buildLayoutPayload(scene) {
 		}
 		combined[""].push(output);
 	});
+	if (overlay) {
+		if (!combined[""]) combined[""] = [];
+		combined[""].push(overlay);
+	}
 	return combined;
 }
 
 function applySceneToFrame() {
 	const scene = getActiveScene();
-	if (!state.iframeReady || !scene) {
-		return;
+	if (state.iframeReady && scene) {
+		const layout = buildLayoutPayload(scene);
+		framePost({ scene: "0", layout });
+		state.lastAppliedSceneId = scene.id;
+		renderScenes();
+		setStatus(scene.auto ? "Auto layout" : "Updated", "live");
 	}
-	const layout = buildLayoutPayload(scene);
-	framePost({ scene: "0", layout });
-	state.lastAppliedSceneId = scene.id;
-	renderScenes();
-	setStatus(scene.auto ? "Auto layout" : "Updated", "live");
-	scheduleSave();
+	saveSession();
 }
 
 function round(value) {
@@ -1872,8 +2120,12 @@ function round(value) {
 }
 
 function beginBoxDrag(event, boxId, mode) {
+	if (event.button !== 0) {
+		return;
+	}
 	event.preventDefault();
 	event.stopPropagation();
+	stageOverlay.focus({ preventScroll: true });
 	const scene = getActiveScene();
 	if (!scene || scene.auto) {
 		return;
@@ -1896,6 +2148,7 @@ function beginBoxDrag(event, boxId, mode) {
 	stageOverlay.dataset.dragging = "true";
 	window.addEventListener("pointermove", handleBoxDrag);
 	window.addEventListener("pointerup", endBoxDrag, { once: true });
+	window.addEventListener("pointercancel", endBoxDrag, { once: true });
 	renderLayout();
 }
 
@@ -1929,12 +2182,13 @@ function handleBoxDrag(event) {
 
 function endBoxDrag() {
 	window.removeEventListener("pointermove", handleBoxDrag);
+	window.removeEventListener("pointerup", endBoxDrag);
+	window.removeEventListener("pointercancel", endBoxDrag);
 	delete stageOverlay.dataset.dragging;
 	state.dragOperation = null;
 	applySceneToFrame();
 	renderBoxInspector();
 	renderScenes();
-	scheduleSave();
 }
 
 function renderJoinSoundButton() {
@@ -2011,7 +2265,7 @@ function addPlaceholder() {
 	};
 	state.placeholders.push(placeholder);
 	renderSources();
-	scheduleSave();
+	saveSession();
 }
 
 function getNextSlot() {
@@ -2039,7 +2293,7 @@ function addSampleSources() {
 		added++;
 	});
 	renderSources();
-	scheduleSave();
+	saveSession();
 	showToast(added ? "Sample sources added" : "Sample sources already added");
 }
 
@@ -2049,15 +2303,34 @@ function updateActiveBrand() {
 	state.brand.labels = document.getElementById("brand-labels").checked;
 	renderLayout();
 	applySceneToFrame();
-	scheduleSave();
 }
 
 async function copyText(value, label) {
 	try {
-		await navigator.clipboard.writeText(value);
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			await navigator.clipboard.writeText(value);
+			showToast(`${label} copied`);
+			return;
+		}
+	} catch (error) {}
+	const input = document.createElement("textarea");
+	const focused = document.activeElement;
+	input.value = value;
+	input.style.cssText = "position:fixed;left:-9999px;top:0;";
+	document.body.append(input);
+	input.select();
+	try {
+		if (!document.execCommand("copy")) {
+			throw new Error("Copy failed");
+		}
 		showToast(`${label} copied`);
 	} catch (error) {
 		showToast(`Unable to copy ${label.toLowerCase()}`);
+	} finally {
+		input.remove();
+		if (focused) {
+			focused.focus();
+		}
 	}
 }
 
@@ -2066,7 +2339,7 @@ function openUrl(url, statusText = "Output window opened") {
 	if (win && typeof win.focus === "function") {
 		win.focus();
 	}
-	setOutputStatus(statusText, win ? "active" : "idle");
+	setOutputStatus(win ? statusText : "Popup blocked", win ? "active" : "idle");
 	if (!win) {
 		showToast("Popup blocked");
 	}
@@ -2101,6 +2374,30 @@ async function startStudio() {
 }
 
 function bindEvents() {
+	const directorButton = document.getElementById("toggle-director");
+	directorButton.addEventListener("click", function () {
+		const open = directorButton.getAttribute("aria-pressed") !== "true";
+		directorButton.setAttribute("aria-pressed", open ? "true" : "false");
+		stage.dataset.directorOpen = open ? "true" : "false";
+		directorFrame.contentDocument.documentElement.dataset.studioDirector = open ? "true" : "false";
+		framePost({ previewMode: !open });
+		if (!open) {
+			framePost({ toggleSettings: false });
+		}
+	});
+	const directorReturn = document.getElementById("director-return");
+	const initialBroadcast = params.get("broadcast") || params.get("bc") || "";
+	directorReturn.checked = (params.has("broadcast") || params.has("bc")) && ["false", "0", "no", "off"].indexOf(initialBroadcast) === -1;
+	directorReturn.addEventListener("change", function () {
+		const current = new URL(window.location.href);
+		current.searchParams.delete("broadcast");
+		current.searchParams.delete("bc");
+		if (directorReturn.checked) {
+			current.searchParams.set("broadcast", "");
+		}
+		history.replaceState(null, "", current.href);
+		renderLinks();
+	});
 	roomForm.addEventListener("submit", event => {
 		event.preventDefault();
 		startStudio();
@@ -2110,7 +2407,21 @@ function bindEvents() {
 		roomNameInput.focus();
 	});
 	directorFrame.addEventListener("load", () => {
+		if (!directorFrame.getAttribute("src")) {
+			return;
+		}
 		state.iframeReady = true;
+		const frameDocument = directorFrame.contentDocument;
+		const style = frameDocument.createElement("style");
+		style.textContent = "html:not([data-studio-director='true']) #controlButtons, html:not([data-studio-director='true']) #miniPerformer, html:not([data-studio-director='true']) #popupSelector { display: none !important; }";
+		frameDocument.head.appendChild(style);
+		directorButton.disabled = false;
+		directorButton.setAttribute("aria-pressed", "false");
+		stage.dataset.directorOpen = "false";
+		if (typeof directorFrame.contentWindow.miniTranslate === "function") {
+			directorFrame.contentWindow.miniTranslate(directorButton);
+			directorFrame.contentWindow.miniTranslate(directorReturn.parentElement);
+		}
 		setStatus("Connected", "live");
 		framePost({ previewMode: true, layout: buildLayoutPayload(getActiveScene()), target: "*" });
 		applySceneToFrame();
@@ -2122,7 +2433,9 @@ function bindEvents() {
 		state.thumbnailTimer = setInterval(requestSourceThumbnails, THUMBNAIL_REFRESH_MS);
 	});
 	window.addEventListener("message", handleFrameMessage);
+	window.addEventListener("pagehide", saveSession);
 	window.addEventListener("beforeunload", () => {
+		saveSession();
 		clearInterval(state.pollTimer);
 		clearInterval(state.thumbnailTimer);
 		for (const source of state.sources.values()) {
@@ -2133,6 +2446,7 @@ function bindEvents() {
 	});
 	window.addEventListener("keydown", event => {
 		const target = event.target;
+		if (target && target.closest('[data-panel="chat"]')) return;
 		if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) {
 			return;
 		}
@@ -2170,7 +2484,9 @@ function bindEvents() {
 	document.getElementById("go-live").addEventListener("click", applySceneToFrame);
 	document.getElementById("add-placeholder").addEventListener("click", addPlaceholder);
 	document.getElementById("add-samples").addEventListener("click", addSampleSources);
-	joinSoundButton?.addEventListener("click", toggleJoinSound);
+	if (joinSoundButton) {
+		joinSoundButton.addEventListener("click", toggleJoinSound);
+	}
 	activeSceneTitle.addEventListener("input", renameActiveSceneLive);
 	activeSceneTitle.addEventListener("change", renameActiveScene);
 	activeSceneTitle.addEventListener("keydown", event => {
@@ -2186,14 +2502,10 @@ function bindEvents() {
 	document.getElementById("box-reset").addEventListener("click", resetSelectedBox);
 	["box-x", "box-y", "box-w", "box-h"].forEach(id => {
 		const updateBoxField = () => {
-			updateSelectedBox({
-				x: document.getElementById("box-x").value,
-				y: document.getElementById("box-y").value,
-				w: document.getElementById("box-w").value,
-				h: document.getElementById("box-h").value
-			});
+			const values = {};
+			values[id.slice(4)] = document.getElementById(id).value;
+			updateSelectedBox(values);
 		};
-		document.getElementById(id).addEventListener("input", updateBoxField);
 		document.getElementById(id).addEventListener("change", updateBoxField);
 	});
 
@@ -2247,7 +2559,39 @@ function bindEvents() {
 	document.getElementById("copy-scene").addEventListener("click", () => copyText(document.getElementById("scene-link").value, "Scene link"));
 	document.getElementById("open-scene").addEventListener("click", () => openUrl(buildSceneUrl(), "Scene link opened"));
 	document.getElementById("record-scene").addEventListener("click", () => openUrl(buildSceneUrl({ record: true }), "Recorder opened"));
-	document.getElementById("open-meshcast").addEventListener("click", () => openUrl("https://app.meshcast.io/", "Meshcast opened"));
+	document.getElementById("open-meshcast").addEventListener("click", () => openUrl("https://app.meshcast.io/dashboard", "Meshcast opened"));
+	document.getElementById("remember-meshcast").addEventListener("change", saveMeshcastEndpoint);
+	document.getElementById("meshcast-endpoint").addEventListener("change", saveMeshcastEndpoint);
+	document.getElementById("meshcast-endpoint").addEventListener("input", function () {
+		document.getElementById("meshcast-storage-status").textContent = "URL edited. Leave this field or select Go Live to apply your remember setting.";
+	});
+	document.getElementById("forget-meshcast").addEventListener("click", function () {
+		try {
+			localStorage.removeItem(MESHCAST_STORAGE_KEY);
+		} catch (error) {
+			document.getElementById("meshcast-storage-status").textContent = "Could not forget the saved URL. Allow browser storage and try again, or clear it in browser site settings.";
+			return;
+		}
+		document.getElementById("meshcast-endpoint").value = "";
+		document.getElementById("remember-meshcast").checked = false;
+		document.getElementById("meshcast-storage-status").textContent = "WHIP URL forgotten. An already open publisher is unaffected.";
+	});
+	document.getElementById("publish-meshcast").addEventListener("click", function () {
+		var endpoint = readMeshcastEndpoint();
+		if (!endpoint) {
+			document.getElementById("meshcast-endpoint").focus();
+			return;
+		}
+		saveMeshcastEndpoint();
+		var url = new URL(buildSceneUrl({ whipEndpoint: endpoint }));
+		// Meshcast RTMP destinations need H.264; keep custom WHIP codec choices unchanged.
+		["mccodec", "meshcastcodec", "mcscreensharecodec", "mcsscodec"].forEach(function (key) {
+			url.searchParams.delete(key);
+		});
+		url.searchParams.set("whipoutcodec", "h264");
+		url.searchParams.set("whipoutscreensharecodec", "h264");
+		openUrl(url.href, "Meshcast publisher opened; check capture and destination status");
+	});
 	document.getElementById("publish-whip").addEventListener("click", () => {
 		const endpoint = document.getElementById("whip-endpoint").value.trim();
 		if (!endpoint) {
@@ -2268,6 +2612,18 @@ function bindEvents() {
 }
 
 bindEvents();
+window.addEventListener("resize", resizeStage);
+if (typeof ResizeObserver !== "undefined") {
+	const stageResizeObserver = new ResizeObserver(resizeStage);
+	stageResizeObserver.observe(stage.parentElement);
+	stageResizeObserver.observe(boxInspector);
+}
+loadMeshcastEndpoint();
+initChat(function (text) {
+	state.featuredChat = text;
+	renderLayout();
+	applySceneToFrame();
+});
 
 if (state.room) {
 	roomNameInput.value = state.room;

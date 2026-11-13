@@ -13,10 +13,10 @@
 		<meta name="robots" content="index, follow" />
 		<meta name="author" content="Steve Seguin" />
 		<meta name="copyright" content="&copy; 2024 Steve Seguin" />
-		<meta name="license" content="https://github.com/steveseguin/vdo.ninja/LICENSE.md" />
+		<meta name="license" content="https://github.com/steveseguin/vdo.ninja/blob/master/LICENSE" />
 		<meta name="sourcecode" content="https://github.com/steveseguin/vdo.ninja" />
 		<meta name="theme-color" content="#0f131d" />
-		<link rel="canonical" href="https://vdo.ninja/check.html" />
+		<link rel="canonical" href="https://vdo.ninja/check" />
 		<title>VDON Stream Test</title>
 		<meta id="metaTitle" name="title" content="VDON Stream Test" />
 		<meta name="description" content="Run a VDO.Ninja preflight test for camera, microphone, bandwidth, and WebRTC connection quality before joining a live room." />
@@ -28,7 +28,7 @@
 		<meta name="twitter:image" content="https://vdo.ninja/media/vdoNinja_logo_full.png">
 
 		<meta property="og:type" content="website">
-		<meta property="og:url" content="https://vdo.ninja/check.html">
+		<meta property="og:url" content="https://vdo.ninja/check">
 		<meta property="og:title" content="VDON Stream Test">
 		<meta property="og:description" content="Run a VDO.Ninja preflight test for camera, microphone, bandwidth, and WebRTC connection quality before joining a live room.">
 		<meta property="og:image" content="https://vdo.ninja/media/vdoNinja_logo_full.png">
@@ -1152,9 +1152,9 @@
 				//iframe.allow = "autoplay";
 				var srcString =	"./index.html?push=" + streamID + "&cleanoutput&privacy&"+testType+"&audiodevice=1&fullscreen&transparent&remote&maxbandwidth&speedtest="+zone;
 				
-				if (urlParams.has("turn")) {
-					srcString = srcString + "&turn=" + urlParams.get("turn");
-				}
+				urlParams.getAll("turn").forEach(function (turnvalue) {
+					srcString = srcString + "&turn=" + encodeURIComponent(turnvalue);
+				});
 
 				// we are changing some text on page load, just to demonstrate what's possible.
 				iframe1.onload = function (e) {
@@ -1213,9 +1213,9 @@
 				iframe.allow = "autoplay";
 				var srcString = "./index.html?view=" + streamID + "&cleanoutput&privacy&noaudio&transparent&bitrate=6000&scale=100&speedtest="+zone; // No TURN servers set on the reciever. Don't want to query for TURN servers needlessly.
 
-				if (urlParams.has("turn")) {
-					srcString = srcString + "&turn=" + urlParams.get("turn");
-				}
+				urlParams.getAll("turn").forEach(function (turnvalue) {
+					srcString = srcString + "&turn=" + encodeURIComponent(turnvalue);
+				});
 
 				if (urlParams.has("buffer")) {
 					srcString = srcString + "&buffer=" + urlParams.get("buffer");
@@ -1257,7 +1257,8 @@
 					
 					if (!recordResults){
 						recordResults = "results_"+streamID;
-						document.getElementById("container").innerHTML = "<br />Link to results: <a target='_blank' href='https://vdo.ninja/results?id="+recordResults+"'>https://vdo.ninja/results?id="+recordResults+"</a><br /><br /><small><i>Results are anonymous and deleted after 7-days</i></small><br /><br /><br />Final Test Results:<br />";
+						var safeRecordResults = recordResults.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;"); // sid comes from the URL
+						document.getElementById("container").innerHTML = "<br />Link to results: <a target='_blank' href='https://vdo.ninja/results?id="+safeRecordResults+"'>https://vdo.ninja/results?id="+safeRecordResults+"</a><br /><br /><small><i>Results are anonymous and deleted after 7-days</i></small><br /><br /><br />Final Test Results:<br />";
 						document.getElementById("graphs").classList.remove('hidden');
 					} 
 					var request = new XMLHttpRequest();

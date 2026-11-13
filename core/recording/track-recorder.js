@@ -30,8 +30,8 @@ export class TrackRecorder extends EventTarget {
     }
     if (kind === 'video') {
       const candidates = [
-        'video/webm;codecs=vp9,opus',
-        'video/webm;codecs=vp8,opus',
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
         'video/webm',
       ];
       return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || null;
@@ -68,6 +68,7 @@ export class TrackRecorder extends EventTarget {
 
     this.mediaRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
+        this.mimeType = event.data.type || this.mediaRecorder.mimeType || this.mimeType;
         this.chunks.push(event.data);
         this.dispatchEvent(new CustomEvent('data', { detail: event.data }));
       }
@@ -86,7 +87,15 @@ export class TrackRecorder extends EventTarget {
       this.dispatchEvent(new CustomEvent('error', { detail: event.error || event }));
     };
 
-    this.mediaRecorder.start(options.timeslice || 0);
+    try {
+      this.mediaRecorder.start(options.timeslice || 0);
+    } catch (error) {
+      if (this.stopResolver) {
+        this.stopResolver();
+        this.stopResolver = null;
+      }
+      throw error;
+    }
   }
 
   stop() {
@@ -107,7 +116,10 @@ export class TrackRecorder extends EventTarget {
       })
       .finally(() => {
         try {
-          this.track.stop();
+          // Cloning can fail; a borrowed live track belongs to the session.
+          if (this.track !== this.sourceTrack) {
+            this.track.stop();
+          }
         } catch (error) {
           console.warn('Failed to stop cloned track', error);
         }
